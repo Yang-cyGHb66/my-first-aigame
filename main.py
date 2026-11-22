@@ -18,6 +18,12 @@ main.py —《英雄大作战 - 原型》程序入口
 import pygame
 
 import settings as s
+import ui
+
+pygame.init()
+
+screen = pygame.display.set_mode((s.WIDTH, s.HEIGHT))
+my_ui=ui.UI()
 
 # ---- 可选模块：容错导入 ----
 try:
