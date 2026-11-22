@@ -270,7 +270,7 @@ def bridge_global_camera(cam):
         import camera as camera_module
         cam = camera_module.Camera(target=player, bounds=world_rect)
         camera_module.camera = cam
-        camera_module.bridge_global_camera(cam)
+                camera_module.bridge_global_camera(cam)
 
     参数：
         cam  Camera 实例
@@ -282,10 +282,19 @@ def bridge_global_camera(cam):
         class _CameraBridge:
             def __init__(self, target_cam):
                 self._cam = target_cam
-                self.offset = (0, 0)
 
             def shake(self, magnitude=3.0, frames=5):
                 self._cam.shake(intensity=magnitude, duration=frames)
+
+            # 兼容 particle.update_all() 里对 camera.update() 的调用：
+            # 震动偏移已由主 Camera.update() 处理，这里只同步 offset 视图。
+            def update(self):
+                pass
+
+            @property
+            def offset(self):
+                return self._cam.get_render_offset()
+
         particle_module.camera = _CameraBridge(cam)
     except Exception:
         # particle 模块缺失或结构不同，静默忽略

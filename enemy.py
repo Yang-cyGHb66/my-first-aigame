@@ -218,16 +218,12 @@ class Enemy(Entity):
             3. hitbox 同步
             4. 父类 update（状态机 / 物理 / 计时器）
         """
-        # ---------- 死亡处理 ----------
+                # ---------- 死亡处理 ----------
         if self.dead:
-            self.dead_timer += 1
+            # 死亡计时由 DeadState 负责推进；这里只递减重生计时
             self.respawn_timer -= 1
-            # 只施加重力让尸体落地，不再跑 AI
-            self.vy += settings.GRAVITY
-            self.move()
-            self.y += 0
             self.hp = 0
-            # 父类仍需要处理物理与状态（DeadState 已接管）
+            # 交给父类 update：状态机（DeadState）驱动重力与落地，避免重复施加
             super().update()
             return
 

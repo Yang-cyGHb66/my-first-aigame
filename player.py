@@ -179,22 +179,29 @@ class Player(Entity):
         spawn_x = self.x + (self.width if self.facing == 1 else -30)
         spawn_y = self.y + self.height * 0.35
 
-        # 通过 projectile 模块生成（缺失时跳过但仍消耗 MP）
-        if projectile_module is not None and hasattr(projectile_module, "Projectile"):
-            try:
-                proj = projectile_module.Projectile(
-                    spawn_x, spawn_y,
-                    direction=self.facing,
-                    speed=12,
-                    damage=settings.DMG_SKILL,
-                    owner=self,
-                )
-                # 尝试注册到全局弹体列表
-                registry = getattr(projectile_module, "PROJECTILES", None)
-                if isinstance(registry, list):
-                    registry.append(proj)
-            except Exception:
-                pass
+                # 通过 projectile 模块生成能量弹（缺失时跳过但仍消耗 MP）
+        # 注意：必须使用 EnergyBall —— Projectile 基类不接受 direction/speed 参数
+        if projectile_module is not None:
+            ball_cls = getattr(projectile_module, "EnergyBall", None)
+            if ball_cls is not None:
+                try:
+                    proj = ball_cls(
+                        spawn_x, spawn_y,
+                        direction=self.facing,
+                        speed=12,
+                        damage=settings.DMG_SKILL,
+                        owner=self,
+                    )
+                    # 注册：优先加入弹道管理器（统一更新/碰撞/绘制）
+                    manager = getattr(self, "projectile_manager", None)
+                    if manager is not None and hasattr(manager, "add"):
+                        manager.add(proj)
+                    else:
+                        registry = getattr(projectile_module, "PROJECTILES", None)
+                        if isinstance(registry, list):
+                            registry.append(proj)
+                except Exception:
+                    pass
 
         # 发射粒子特效
         if particle_module is not None:

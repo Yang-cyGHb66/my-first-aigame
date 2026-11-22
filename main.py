@@ -1,383 +1,334 @@
 """
-main.py —《英雄大作战 - 原型》程序入口
+main.py —《英雄大作战 - 原型》主入口
 
-职责（只做编排，不含游戏逻辑）：
-    1. 初始化 Pygame 与实体
-    2. 事件分发（事件缓存后共享给 Player，避免重复消费丢失）
-    3. 主循环：输入 -> 更新 -> 碰撞/战斗判定 -> 渲染 -> 帧率控制
-    4. HUD 与波次提示
+结构：
+    Game 类封装整个游戏生命周期：
+        __init__ -> reset -> run(handle_events / update / draw 循环)
+    模块导入全部置于顶部；运行时依赖通过延迟初始化解决循环引用。
 
-模块依赖：
-    settings  — 全局常量
-    player    — 玩家角色（含输入、连招、技能）
-    enemy     — 敌人 AI 与波次管理
-    projectile— 弹体（可选，缺失时降级）
-    particle  — 粒子（可选，缺失时降级）
+镜头处理：
+    entity/player/enemy/projectile 的 draw 直接画到 target surface，
+    世界坐标即屏幕坐标（单屏世界）。为了让 camera 的震动/跟随对实体生效：
+    做法是「平移画布」——绘制世界层时给所有实体套一层坐标偏移。
+    由于既有 Entity.draw 不接收 offset 参数，本实现用「临时偏移注入」：
+        camera_ctx 上下文：把实体的 x/y 临时减去 offset，绘制后复原。
+    这样既不改动既有 draw 代码，又能让镜头偏移作用到全部实体。
 """
+
+import sys
+import random
 
 import pygame
 
-import settings as s
-import ui
-
-pygame.init()
-
-screen = pygame.display.set_mode((s.WIDTH, s.HEIGHT))
-my_ui=ui.UI()
-
-# ---- 可选模块：容错导入 ----
-try:
-    import projectile as projectile_module
-except Exception:
-    projectile_module = None
-
-try:
-    import particle as particle_module
-except Exception:
-    particle_module = None
+import settings
+from player import Player
+from enemy import EnemyManager
+from projectile import ProjectileManager
+from particle import effects
+import particle
+import camera as camera_module
+from ui import ui
 
 
 # ============================================================
-# 共享资源
+# 临时坐标偏移（镜头平移适配）
 # ============================================================
-class Fonts:
-    """集中管理字体，避免每帧 SysFont 创建开销。"""
+class _CameraOffsetCtx:
+    """
+    上下文管理器：进入时把实体的绘制坐标按镜头偏移平移，退出时复原。
+    这样既有 Entity.draw（直接读 self.x/self.y）无需修改即可配合镜头。
+    """
+    def __init__(self, camera, entities):
+        self.camera = camera
+        self.entities = entities
+        self.saved = []
+
+    def __enter__(self):
+        ox, oy = self.camera.get_render_offset()
+        for e in self.entities:
+            self.saved.append((e, e.x, e.y))
+            e.x += ox
+            e.y += oy
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for e, sx, sy in self.saved:
+            e.x = sx
+            e.y = sy
+        return False
+
+
+# ============================================================
+# Game 类
+# ============================================================
+class Game:
+    """游戏主类：封装初始化、重置、事件、更新、绘制、主循环。"""
+
+    # -------------------- 初始化 --------------------
     def __init__(self):
-        # 兼容中文：优先黑体/雅黑，回退系统默认
-        self.hud = pygame.font.SysFont("microsoftyahei,simhei,arial", 16)
-        self.big = pygame.font.SysFont("microsoftyahei,simhei,arial", 34, bold=True)
-        self.small = pygame.font.SysFont("microsoftyahei,simhei,arial", 13)
+        pygame.init()
+        self.screen = pygame.display.set_mode((settings.WIDTH, settings.HEIGHT))
+        pygame.display.set_caption(settings.TITLE)
+        self.clock = pygame.time.Clock()
+        self.running = True
 
+        # 实体与系统（在 reset 中创建）
+        self.player = None
+        self.enemy_manager = None
+        self.projectile_manager = None
+        self.camera = None
 
-# ============================================================
-# 战斗判定辅助
-# ============================================================
-def resolve_player_attack(player, enemies):
-    """
-    玩家攻击命中敌人：
-        - 取玩家 get_hitbox()（仅判定阶段非 None）
-        - 与每个存活敌人的 hurtbox 相交则造成伤害
-        - 伤害：第三段用 DMG_COMBO3 并强制击退，其余用 DMG_NORMAL
-        - 命中后短暂冷却，避免同一判定框连续多帧重复扣血
-    """
-    hitbox = player.get_hitbox()
-    if hitbox is None:
-        return
+        # 游戏状态
+        self.game_state = "playing"    # playing / victory / defeat
+        self.wave_announce_timer = 0
+        self.current_wave = 0
 
-    # 每帧只对每个敌人结算一次（用本帧命中集合）
-    for enemy in enemies:
-        if enemy.dead:
-            continue
-        # 无敌帧 / 已死亡跳过由 take_damage 内部处理
-        if hitbox.colliderect(enemy.hurtbox):
-            is_finisher = player.combo_count >= 3
-            dmg = s.DMG_COMBO3 if is_finisher else s.DMG_NORMAL
-            enemy.take_damage(dmg, attacker=player, knockback=True)
-            # 命中后立刻清空 hitbox，避免同一次攻击重复结算
-            player.hitbox = None
-            break   # 一次判定命中一个敌人即可（如需横扫可去掉 break）
+        self.reset()
 
+    # -------------------- 重置 --------------------
+    def reset(self):
+        """
+        重置所有游戏对象到初始状态。
+        玩家位置 (100, GROUND_Y - 100)，敌人管理器生成第一波。
+        """
+        # 玩家：脚底贴地（entity 高 96，故 y = GROUND_Y - 96）
+        self.player = Player(x=100, y=settings.GROUND_Y - 96)
 
-def resolve_enemy_attacks(enemies, player):
-    """
-    敌人攻击命中玩家：
-        - 每个敌人 get_hitbox() 与玩家 hurtbox 相交则扣 DMG_NORMAL
-        - 命中后清空该敌人 hitbox，避免重复结算
-    """
-    if player.invincible_timer > 0 or player.dead:
-        return
-    for enemy in enemies:
-        if enemy.dead:
-            continue
-        hb = enemy.get_hitbox()
-        if hb is None:
-            continue
-        if hb.colliderect(player.hurtbox):
-            player.take_damage(s.DMG_NORMAL, attacker=enemy, knockback=True)
-            enemy.hitbox = None
-            break
+        # 敌人管理器（内部自动生成第 0 波）
+        self.enemy_manager = EnemyManager()
 
+        # 弹道管理器
+        self.projectile_manager = ProjectileManager()
 
-def resolve_projectiles(enemies, player):
-    """
-    更新弹体并处理与敌人的碰撞。
-    依赖 projectile 模块提供 PROJECTILES 列表与弹体接口：
-        proj.update()
-        proj.draw(surface)
-        proj.alive  (bool)
-        proj.rect   (可选，没有则用 x/y + 尺寸)
-        proj.damage
-        proj.owner
-    """
-    if projectile_module is None:
-        return
-    projectiles = getattr(projectile_module, "PROJECTILES", None)
-    if not isinstance(projectiles, list):
-        return
+        # 关键：把弹道管理器注入玩家，使技能弹体进入统一更新/碰撞/绘制流程
+        self.player.projectile_manager = self.projectile_manager
 
-    for p in list(projectiles):
-        # 更新
-        if hasattr(p, "update"):
-            p.update()
+        # 镜头：跟随玩家，单屏世界边界
+        world_rect = pygame.Rect(0, 0, settings.WIDTH, settings.HEIGHT)
+        self.camera = camera_module.Camera(target=self.player, bounds=world_rect)
+        # 注册为全局 camera（兼容其它模块引用）
+        camera_module.camera = self.camera
+                # 桥接 particle 的 shake 到本 Camera（使 entity/projectile 的震动生效）
+        camera_module.bridge_global_camera(self.camera)
 
-        # 命中敌人（弹体属于玩家时）
-        owner = getattr(p, "owner", None)
-        if owner is player and not owner is None:
-            p_rect = _proj_rect(p)
-            if p_rect is not None:
-                for enemy in enemies:
-                    if enemy.dead:
-                        continue
-                    if p_rect.colliderect(enemy.hurtbox):
-                        enemy.take_damage(getattr(p, "damage", s.DMG_SKILL),
-                                          attacker=player, knockback=True)
-                        _kill_projectile(p, projectiles)
-                        break
+        # 重置状态
+        self.game_state = "playing"
+        self.current_wave = 0
+        # 注意：EnemyManager 构造时已生成第 0 波，这里不再重复 spawn_wave(0)
+        self.current_wave = self.enemy_manager.current_wave
+        self.wave_announce_timer = 90
 
-        # 出屏移除
-        if not getattr(p, "alive", True):
-            _kill_projectile(p, projectiles)
-            continue
-        px = getattr(p, "x", 0)
-        if px < -60 or px > s.WIDTH + 60:
-            _kill_projectile(p, projectiles)
-
-
-def _proj_rect(p):
-    """尽量获取弹体矩形（优先 rect 属性，其次 x/y/w/h）。"""
-    rect = getattr(p, "rect", None)
-    if isinstance(rect, pygame.Rect):
-        return rect
-    x = getattr(p, "x", None)
-    y = getattr(p, "y", None)
-    if x is None or y is None:
-        return None
-    w = getattr(p, "width", 10)
-    h = getattr(p, "height", 10)
-    return pygame.Rect(int(x - w / 2), int(y - h / 2), w, h)
-
-
-def _kill_projectile(p, projectiles):
-    """从弹体列表中移除并标记死亡。"""
-    try:
-        if hasattr(p, "alive"):
-            p.alive = False
-    except Exception:
-        pass
-    if p in projectiles:
-        projectiles.remove(p)
-
-
-def update_particles():
-    """驱动粒子模块（若提供 update_all）。"""
-    if particle_module is not None and hasattr(particle_module, "update_all"):
-        try:
-            particle_module.update_all()
-        except Exception:
-            pass
-
-
-def draw_particles(surface):
-    """绘制粒子（若提供 draw_all）。"""
-    if particle_module is not None and hasattr(particle_module, "draw_all"):
-        try:
-            particle_module.draw_all(surface)
-        except Exception:
-            pass
-
-
-def draw_projectiles(surface):
-    """绘制弹体。"""
-    if projectile_module is None:
-        return
-    projectiles = getattr(projectile_module, "PROJECTILES", None)
-    if not isinstance(projectiles, list):
-        return
-    for p in list(projectiles):
-        if hasattr(p, "draw"):
-            try:
-                p.draw(surface)
-            except Exception:
-                pass
-
-
-# ============================================================
-# HUD 绘制
-# ============================================================
-def draw_hud(surface, fonts, player, manager, wave_text_timer):
-    """
-    HUD：
-        - 左上：HP/MP/SP 数值
-        - 右上：波次与剩余敌人
-        - 中上：波次切换提示（wave_text_timer > 0 时显示）
-        - 底部：操作提示
-    """
-    # 左上属性
-    surface.blit(fonts.hud.render(f"HP {int(player.hp)}/{player.hp_max}", True, s.HP_RED), (10, 8))
-    surface.blit(fonts.hud.render(f"MP {int(player.mp)}/{player.mp_max}", True, s.MP_BLUE), (10, 28))
-    surface.blit(fonts.hud.render(f"SP {int(player.sp)}/{player.sp_max}", True, s.SP_YELLOW), (10, 48))
-
-    # 右上波次
-    wave_label = f"波次 {manager.current_wave + 1}/{manager.total_waves}"
-    alive = manager.alive_count()
-    wave_surf = fonts.hud.render(f"{wave_label}   敌人 {alive}", True, s.WHITE)
-    wave_bg = pygame.Surface((wave_surf.get_width() + 12, wave_surf.get_height() + 6), pygame.SRCALPHA)
-    wave_bg.fill((0, 0, 0, 100))
-    tx = s.WIDTH - wave_surf.get_width() - 18
-    surface.blit(wave_bg, (tx - 6, 6))
-    surface.blit(wave_surf, (tx, 9))
-
-    # 中上波次切换提示
-    if wave_text_timer > 0:
-        text = "第 {} 波".format(manager.current_wave + 1)
-        big = fonts.big.render(text, True, s.YELLOW)
-        # 随时间淡出
-        alpha = min(255, int(255 * (wave_text_timer / 90)))
-        tmp = big.copy()
-        tmp.set_alpha(alpha)
-        rect = tmp.get_rect(center=(s.WIDTH // 2, 90))
-        surface.blit(tmp, rect)
-
-    # 底部操作提示
-    tip = fonts.small.render(
-        "A/D 移动  Shift 奔跑  W 跳跃  J 攻击  K 空中攻击  L 技能  S 防御  R 复活  F1 调试",
-        True, s.WHITE,
-    )
-    tip_bg = pygame.Surface((tip.get_width() + 8, tip.get_height() + 6), pygame.SRCALPHA)
-    tip_bg.fill((0, 0, 0, 90))
-    surface.blit(tip_bg, (6, s.HEIGHT - tip_bg.get_height() - 4))
-    surface.blit(tip, (10, s.HEIGHT - tip.get_height() - 6))
-
-
-def draw_death_overlay(surface, fonts, player):
-    """玩家死亡提示。"""
-    if not player.dead:
-        return
-    overlay = pygame.Surface((s.WIDTH, s.HEIGHT), pygame.SRCALPHA)
-    overlay.fill((0, 0, 0, 120))
-    surface.blit(overlay, (0, 0))
-    msg = fonts.big.render("你被击倒了！按 R 复活", True, s.RED)
-    rect = msg.get_rect(center=(s.WIDTH // 2, s.HEIGHT // 2))
-    surface.blit(msg, rect)
-
-
-def draw_victory_overlay(surface, fonts):
-    """通关提示。"""
-    overlay = pygame.Surface((s.WIDTH, s.HEIGHT), pygame.SRCALPHA)
-    overlay.fill((0, 0, 0, 150))
-    surface.blit(overlay, (0, 0))
-    msg = fonts.big.render("全部波次清除！胜利！", True, s.YELLOW)
-    rect = msg.get_rect(center=(s.WIDTH // 2, s.HEIGHT // 2 - 10))
-    surface.blit(msg, rect)
-    sub = fonts.hud.render("按 ESC 退出", True, s.WHITE)
-    surface.blit(sub, sub.get_rect(center=(s.WIDTH // 2, s.HEIGHT // 2 + 40)))
-
-
-# ============================================================
-# 主函数
-# ============================================================
-def main():
-    # ---------- 初始化 ----------
-    pygame.init()
-    screen = pygame.display.set_mode((s.WIDTH, s.HEIGHT))
-    pygame.display.set_caption(s.TITLE)
-    clock = pygame.time.Clock()
-    fonts = Fonts()
-
-    # 延迟导入实体，确保 pygame 已初始化
-    from player import Player
-    from enemy import EnemyManager
-
-    player = Player(x=120, y=s.GROUND_Y - 96)
-    manager = EnemyManager()
-
-    # 状态标志
-    show_debug = False
-    wave_text_timer = 60      # 初始显示“第 1 波”
-    victory = False           # 是否已通关
-
-    running = True
-
-    # ---------- 主循环 ----------
-    while running:
-        # 1. 事件处理（缓存后共享给 Player，避免事件被提前消费）
+    # -------------------- 事件 --------------------
+    def handle_events(self):
+        """
+        事件处理：
+            QUIT / ESC -> 退出
+            R（非 playing 状态）-> 重开
+        事件列表缓存后额外交给 player（Player.handle_input 内部已能读队列，
+        但为避免双重消费导致 R 复活失效，主循环也兜底处理 R）。
+        """
         events = pygame.event.get()
         for event in events:
             if event.type == pygame.QUIT:
-                running = False
+                self.running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    running = False
-                elif event.key == pygame.K_F1:
-                    show_debug = not show_debug
-                elif event.key == pygame.K_r and player.dead:
-                    player.respawn()
+                    self.running = False
+                elif event.key == pygame.K_r:
+                    # 结算后重开
+                    if self.game_state != "playing":
+                        self.reset()
+                    # playing 状态下按 R 由 Player 内部处理（玩家死亡复活）
 
-        # Player 内部需要用事件做 R / ESC 判定，这里把缓存事件塞给它
-        # （player.handle_input 会在 update 中调用，见下方兼容处理）
-        player._cached_events = events
+        # 把缓存事件交给 Player（可选钩子）
+        try:
+            self.player._cached_events = events
+        except Exception:
+            pass
 
-        # 2. 逻辑更新
-        player.update()
-        manager.update(player)
+    # -------------------- 更新 --------------------
+    def update(self):
+        """逻辑更新：实体 -> 弹道 -> 粒子 -> 镜头 -> 状态检查。"""
+        if self.game_state == "playing":
+            # 1. 玩家
+            self.player.update()
 
-        # 3. 战斗判定
-        resolve_player_attack(player, manager.enemies)
-        resolve_enemy_attacks(manager.enemies, player)
-        resolve_projectiles(manager.enemies, player)
-        update_particles()
+                        # 2. 敌人
+            self.enemy_manager.update(self.player)
 
-        # 4. 波次推进
-        if not victory:
-            if manager.all_dead():
-                if manager.is_last_wave():
-                    # 最后一波清光 -> 通关
-                    victory = True
+            # 3. 弹道：更新 + 碰撞检测（目标含玩家和所有敌人，owner 会自动跳过）
+            targets = [self.player] + self.enemy_manager.enemies
+            self.projectile_manager.update(targets)
+            self.projectile_manager.clear()
+
+            # 4. 粒子（模块级 update_all 推进粒子）
+            particle.update_all()
+
+            # 5. 镜头（update 内部已包含 follow 平滑跟随 + 震动更新）
+            self.camera.update()
+
+            # 6. 状态检查：玩家死亡 -> 失败
+            if self.player.hp <= 0 and self.game_state == "playing":
+                self.game_state = "defeat"
+
+            # 7. 状态检查：敌人全灭 -> 下一波 或 胜利
+            elif self.game_state == "playing" and self.enemy_manager.all_dead():
+                if self.enemy_manager.is_last_wave():
+                    self.game_state = "victory"
                 else:
-                    if manager.next_wave():
-                        wave_text_timer = 90
+                    if self.enemy_manager.next_wave():
+                        self.current_wave = self.enemy_manager.current_wave
+                        self.wave_announce_timer = 90
 
-        # 波次提示淡出
-        if wave_text_timer > 0:
-            wave_text_timer -= 1
+        # 波次公告计时递减
+        if self.wave_announce_timer > 0:
+            self.wave_announce_timer -= 1
 
-        # 5. 渲染 —— 背景
-        screen.fill(s.SKY_BLUE)
-        # 远景色块装饰（云或山，简化为两个浅色块）
-        pygame.draw.ellipse(screen, (200, 230, 250), (60, 70, 180, 50))
-        pygame.draw.ellipse(screen, (210, 235, 250), (560, 120, 160, 40))
-        # 草地条
-        pygame.draw.rect(screen, s.GRASS_GREEN, (0, s.GROUND_Y - 8, s.WIDTH, 8))
-        # 地面
-        ground = pygame.Rect(0, s.GROUND_Y, s.WIDTH, s.HEIGHT - s.GROUND_Y)
-        pygame.draw.rect(screen, s.GROUND_BROWN, ground)
-        pygame.draw.line(screen, s.BLACK, (0, s.GROUND_Y), (s.WIDTH, s.GROUND_Y), 2)
+    # -------------------- 绘制 --------------------
+    def draw(self):
+        """渲染：背景 -> 实体（含镜头偏移）-> 粒子 -> UI -> 结算。"""
+        # 1. 背景（视差）
+        self.draw_background()
 
-        # 6. 渲染 —— 实体与效果
-        manager.draw(screen)
-        player.draw(screen)
-        draw_projectiles(screen)
-        draw_particles(screen)
+        # 2. 世界层实体（镜头偏移对实体位置生效）
+        world_entities = list(self.enemy_manager.enemies) + [self.player]
 
-        # 7. 调试框
-        if show_debug:
-            player.draw_debug(screen)
-            for enemy in manager.enemies:
-                enemy.draw_debug(screen)
+        with _CameraOffsetCtx(self.camera, world_entities):
+            # 敌人
+            for enemy in self.enemy_manager.enemies:
+                enemy.draw(self.screen)
+            # 玩家
+            self.player.draw(self.screen)
 
-        # 8. HUD 与覆盖层
-        draw_hud(screen, fonts, player, manager, wave_text_timer)
-        draw_death_overlay(screen, fonts, player)
-        if victory:
-            draw_victory_overlay(screen, fonts)
+        # 3. 弹道（弹体自带绘制，坐标也需镜头偏移）
+        with _CameraOffsetCtx(self.camera, self.projectile_manager.projectiles):
+            self.projectile_manager.draw(self.screen)
+
+        # 4. 粒子（粒子位置是世界坐标，也需偏移；但粒子由 particle 模块绘制，
+        #    这里直接对粒子列表做偏移上下文）
+        with _CameraOffsetCtx(self.camera, effects.particles):
+            effects.draw(self.screen)
+
+        # 5. UI（屏幕层，不跟随镜头）
+        self.draw_ui()
+
+        # 6. 结算遮罩
+        if self.game_state == "victory":
+            ui.draw_game_over(self.screen, "VICTORY")
+        elif self.game_state == "defeat":
+            ui.draw_game_over(self.screen, "DEFEAT")
 
         pygame.display.flip()
 
-        # 9. 帧率控制
-        clock.tick(s.FPS)
+    # -------------------- 背景 --------------------
+    def draw_background(self):
+        """
+        三层背景：
+            天空（SKY_BLUE）+ 远山（深绿三角，半透明，视差 0.3x）+ 地面（GRASS_GREEN）
+        视差：远山的绘制位置按 camera.offset_x * 0.3 偏移。
+        """
+        # ---- 1. 天空 ----
+        sky_rect = pygame.Rect(0, 0, settings.WIDTH, settings.GROUND_Y)
+        self.screen.fill(settings.SKY_BLUE, sky_rect)
 
-    pygame.quit()
+        # 天空顶部渐变（浅 -> SKY_BLUE），简易两段色增加层次
+        top = pygame.Surface((settings.WIDTH, 80), pygame.SRCALPHA)
+        for i in range(80):
+            alpha = int(60 * (1 - i / 80))
+            pygame.draw.line(top, (255, 255, 255, alpha), (0, i), (settings.WIDTH, i))
+        self.screen.blit(top, (0, 0))
+
+        # ---- 2. 远山（视差 0.3） ----
+        parallax_x = self.camera.offset_x * 0.3
+        mountains = [
+            # (中心x, 山顶y, 山底宽)
+            (-100, settings.GROUND_Y - 260, 420),
+            (240, settings.GROUND_Y - 220, 360),
+            (560, settings.GROUND_Y - 280, 460),
+            (880, settings.GROUND_Y - 200, 340),
+        ]
+        mountain_surf = pygame.Surface((settings.WIDTH, settings.GROUND_Y), pygame.SRCALPHA)
+        for mcx, my, mw in mountains:
+            sx = mcx - parallax_x
+            # 只画视野内的山
+            if sx > settings.WIDTH + mw or sx < -mw:
+                continue
+            base_y = settings.GROUND_Y
+            pts = [
+                (int(sx), int(my)),
+                (int(sx - mw / 2), base_y),
+                (int(sx + mw / 2), base_y),
+            ]
+            # 半透明深绿（alpha=160）
+            pygame.draw.polygon(mountain_surf, (60, 140, 70, 160), pts)
+            # 山体暗边
+            pygame.draw.polygon(mountain_surf, (40, 105, 55, 210), pts, 2)
+        self.screen.blit(mountain_surf, (0, 0))
+
+        # ---- 3. 地面 ----
+        ground_rect = pygame.Rect(0, settings.GROUND_Y, settings.WIDTH, settings.HEIGHT - settings.GROUND_Y)
+        pygame.draw.rect(self.screen, settings.GRASS_GREEN, ground_rect)
+
+        # 地面线（4px 厚棕色）
+        pygame.draw.line(self.screen, settings.GROUND_BROWN,
+                         (0, settings.GROUND_Y),
+                         (settings.WIDTH, settings.GROUND_Y), 4)
+
+        # 地面纹理：视差草簇（0.5x）
+        grass_surf = pygame.Surface((settings.WIDTH, settings.HEIGHT - settings.GROUND_Y), pygame.SRCALPHA)
+        grass_parallax = self.camera.offset_x * 0.5
+        for gx in range(-1, settings.WIDTH // 40 + 3):
+            px = int(gx * 40 - (grass_parallax % 40))
+            pygame.draw.line(grass_surf, (80, 140, 60, 220),
+                             (px, settings.GROUND_Y - settings.GROUND_Y),
+                             (px + 4, settings.GROUND_Y - settings.GROUND_Y - 12), 2)
+        self.screen.blit(grass_surf, (0, settings.GROUND_Y - 12))
+
+    # -------------------- UI --------------------
+    def draw_ui(self):
+        """绘制所有 UI 元素（屏幕坐标，不随镜头移动）。"""
+        # 玩家属性条
+        ui.draw_player_ui(self.screen, self.player)
+
+        # 敌人/波次
+        ui.draw_enemy_ui(self.screen, self.enemy_manager)
+
+        # 连击数（用 combo_display 展示残留，而非 combo_count 瞬时值）
+        ui.draw_combo(self.screen, self.player.combo_display, self.player.combo_display_timer)
+
+        # 波次公告
+        if self.wave_announce_timer > 0:
+            ui.draw_wave_announce(self.screen,
+                                  self.enemy_manager.current_wave + 1,
+                                  self.wave_announce_timer)
+
+        # 操作说明
+        ui.draw_controls(self.screen)
+
+        # FPS（调试）
+        ui.draw_fps(self.screen, self.clock.get_fps())
+
+    # -------------------- 主循环 --------------------
+    def run(self):
+        """游戏主循环：事件 -> 更新 -> 绘制 -> 帧率控制。"""
+        while self.running:
+            # 1. 事件处理
+            self.handle_events()
+            # 2. 逻辑更新
+            self.update()
+            # 3. 渲染
+            self.draw()
+            # 4. 帧率控制
+            self.clock.tick(settings.FPS)
+
+        # 退出清理
+        pygame.quit()
+        sys.exit()
 
 
+# ============================================================
+# 入口
+# ============================================================
 if __name__ == "__main__":
-    main()
+    game = Game()
+    game.run()

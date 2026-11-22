@@ -72,13 +72,42 @@ def lerp_color(c1, c2, t):
 class UI:
     """游戏 UI 绘制集合。"""
 
+    # 统一字体族；逗号分隔可多字体回退
+    FONT_FAMILY = "microsoftyahei,simhei,arial"
+
     def __init__(self):
-        # 统一字体族；逗号分隔可多字体回退
-        family = "microsoftyahei,simhei,arial"
+        # 字体延迟创建（见 _ensure_fonts）：避免在 pygame.font 初始化前调用 SysFont。
+        # 模块导入时会立即实例化 ui 单例，此时 pygame.init() 可能尚未执行。
+        self.font_small = None
+        self.font_medium = None
+        self.font_large = None
+        self.font_huge = None
+        self._fonts_ready = False
+
+    def _ensure_fonts(self):
+        """确保字体已初始化并创建（幂等）。"""
+        if self._fonts_ready:
+            return
+        if not pygame.font.get_init():
+            pygame.font.init()
+        family = self.FONT_FAMILY
         self.font_small = pygame.font.SysFont(family, 14)
         self.font_medium = pygame.font.SysFont(family, 20)
         self.font_large = pygame.font.SysFont(family, 34, bold=True)
         self.font_huge = pygame.font.SysFont(family, 56, bold=True)
+        self._fonts_ready = True
+
+    def _font(self, size, bold=False):
+        """获取指定字号的字体（带缓存），供连击数等动态字号使用。"""
+        self._ensure_fonts()
+        cache = getattr(self, "_font_cache", None)
+        if cache is None:
+            cache = {}
+            self._font_cache = cache
+        key = (size, bold)
+        if key not in cache:
+            cache[key] = pygame.font.SysFont(self.FONT_FAMILY, size, bold=bold)
+        return cache[key]
 
     # -------------------- 1. 通用属性条 --------------------
     def draw_health_bar(self, surface, x, y, width, height,
@@ -92,9 +121,10 @@ class UI:
             height   条高
             current  当前值
             max_val  最大值
-            color    填充色
+                        color    填充色
             label    左侧标签（如 "HP"）
         """
+        self._ensure_fonts()
         # 比例裁剪
         ratio = 0.0
         if max_val > 0:
@@ -208,7 +238,7 @@ class UI:
         font_size = min(60, 30 + (combo_count - 1) * 5)
         font = pygame.font.SysFont("microsoftyahei,simhei,arial", font_size, bold=True)
 
-        # 颜色：1-2 白，3-5 黄，6+ 红
+                # 颜色：1-2 白，3-5 黄，6+ 红
         if combo_count <= 2:
             color = settings.WHITE
         elif combo_count <= 5:
@@ -216,11 +246,11 @@ class UI:
         else:
             color = settings.RED
 
-        # 缩放动画：刚出现（timer 接近窗口上限）时 1.3 倍，逐渐回到 1.0
-        # 用 combo_timer 相对 COMBO_WINDOW 的进度估出“年龄”
+        # 缩放动画：刚出现时放大 1.3 倍，逐渐回到 1.0。
+        # 以 COMBO_WINDOW 作为“满进度”基准；combo_timer 取实际显示计时。
         window = max(1, settings.COMBO_WINDOW)
-        # 计时越大说明越“新”，映射到缩放系数
-        t = max(0.0, min(1.0, combo_timer / window))
+        # 进度 1.0 表示刚出现（放大），0.0 表示即将消失（原始大小）
+        t = max(0.0, min(1.0, combo_timer / float(window)))
         scale = 1.0 + 0.3 * t
 
         text = f"{combo_count} 连击！"
@@ -350,7 +380,7 @@ class UI:
     # -------------------- 8. 帧率 --------------------
     def draw_fps(self, surface, fps):
         """
-        右上角显示帧率（调试用）。
+                右上角显示帧率（调试用）。
         参数：
             surface 目标 surface
             fps     当前帧率（float）
@@ -361,3 +391,9 @@ class UI:
         x = settings.WIDTH - ts.get_width() - 14
         y = 60
         draw_text_shadow(surface, self.font_small, text, (180, 255, 180), (x, y))
+
+
+# ============================================================
+# 全局单例：模块级实例，供 `from ui import ui` 使用
+# ============================================================
+ui = UI()
