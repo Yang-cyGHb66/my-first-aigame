@@ -212,13 +212,13 @@ class Enemy(Entity):
     # -------------------- 更新 --------------------
     def update_with_player(self, player):
         """
-        更新敌人：
+                更新敌人：
             1. 死亡计时处理
             2. AI 决策 / 执行
             3. hitbox 同步
             4. 父类 update（状态机 / 物理 / 计时器）
         """
-                # ---------- 死亡处理 ----------
+        # ---------- 死亡处理 ----------
         if self.dead:
             # 死亡计时由 DeadState 负责推进；这里只递减重生计时
             self.respawn_timer -= 1
